@@ -1,3 +1,106 @@
+/** 
+ * \brief Per-thread synchronization data for MiniMutex.
+ */
+class MiniMutex::Waiter
+{
+  private:
+    /// Handle to the OS kernel's synchronization object.
+    HANDLE eventHandle;
+    
+  public:
+    /// Number of successful attempts by this thread to lock a MiniMutex.
+    std::atomic<unsigned int> numLocks;
+
+    /// Count of how many times this thread had to contend for a lock.
+    std::atomic<unsigned int> numContentions;
+
+    /**
+     * \brief The immediately preceding thread on the waiting list 
+     *        for the same locked MiniMutex that this thread is
+     *        blocked on.
+     *
+     * This is the pointer to the "next" node in the linked 
+     * list of waiters.  The linked list is in backwards 
+     * chronological order.
+     *
+     * This member is only modified by the owner thread of MiniMutex::Waiter.
+     *
+     * When a lock is passed from one thread (inside to MiniMutex::lock) 
+     * to another waiting thread, in principle, the former thread should 
+     * be setting this member to null, to indicate the new ownership.  
+     * But we can, and do, make the latter thread instead set this member
+     * to null.  This avoids cacheline bouncing for this per-thread 
+     * synchronization data.  It turns out to conceptually cleaner, in
+     * this respect: the pointers to Waiters not representing the current 
+     * thread can now all be made \c const, preventing erroneous 
+     * modifications.  And this member does not even have to be atomic, 
+     * because it can be synchronized using acquire/release semantics only.
+     */
+    const Waiter* waitingOn;
+
+    /**
+     * \brief Initialize per-thread data for MiniMutex.
+     */
+    Waiter()
+      : eventHandle(nullptr)
+      , numLocks(0)
+      , numContentions(0)
+      , waitingOn(nullptr)
+    {
+    }
+
+    /**
+     * \brief Clean up per-thread data for MiniMutex.  Intended to be
+     *        called when the thread exits.
+     */
+    ~Waiter()
+    {
+      if( eventHandle != nullptr )
+        ::CloseHandle(eventHandle);
+    }
+
+    /**
+     * \brief Create the kernel-level synchronization object if it
+     *        had not been already.
+     *
+     * This method must be called before #wait and #signal. 
+     */
+    void createEventObject()
+    {
+      if( eventHandle != nullptr )
+      {
+        eventHandle = ::CreateEventW(nullptr,   // no security attributes
+                                     FALSE,     // auto-reset event
+                                     FALSE,     // initially not signaled
+                                     nullptr);  // anonymous event
+      }
+    }
+
+    /**
+     * \brief Block the current (owner) thread until the kernel-level
+     *        synchronization object is signaled.
+     *
+     * If the signaling thread races ahead of the waiter
+     * thread, the waiter thread still gets the signal.
+     * In Win32, an auto-reset event guarantees this behavior.
+     */
+    void wait()
+    {
+      ::WaitForSingleObject(eventHandle, INFINITE);
+    }
+
+    /**
+     * \brief Signal from a non-owner thread to release the owner
+     *        thread (represented by this Waiter object) from blocking.
+     */
+    void signal() const
+    {
+      ::SetEvent(eventHandle);
+    }
+};
+
+ThreadSpecificObject<MiniMutex::Waiter> miniMutexWaiter;
+
 /**
  * \brief Mutex that shares kernel synchronization objects amongst
  *        all instances.
